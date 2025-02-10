@@ -12,18 +12,18 @@ import argparse
 import torch.distributed as dist
 from torch.nn import functional as F
 os.environ['USE_WKV_CUDA_FOR_RWKV'] = 'True'
-
+from tqdm import tqdm
 from pathlib import Path
 from util.slconfig import DictAction, SLConfig
 from util.logger import setup_logger
 from util import misc
-from util.utils import BestMetricHolder, SmoothedValue
+from util.utils import BestMetricHolder
 from torch.optim import Adam
-from models.RWKV_V4.rwkv_v4_train import L2Wrap
 from torch.utils.data import DataLoader, DistributedSampler
 from dataset.dataset import TransformerXLTrainDataSet, TransformerXLTestDataSet
 from dataset.enwik_dataset import EnWikTrainDataSet, EnWikTestDataSet
 from dataset.enwik_ascii_dataset import EnWikASCIITrainDataSet, EnWikASCIITestDataSet
+from util.cal import calculate_metrics as cal
 
 
 def get_args_parser():
@@ -45,13 +45,13 @@ def get_args_parser():
     parser.add_argument('--pretrain_model_path', help='load from other checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--find_unused_params', action='store_true')
     parser.add_argument('--save_log', action='store_true')
 
     # distributed training parameters
-    parser.add_argument("--distributed", default=False, action='store_true')
+    parser.add_argument("--distributed", default=True, action='store_true')
     parser.add_argument('--rank', default=0, type=int,
                         help='number of distributed processes')
     parser.add_argument('--amp', action='store_true',
@@ -97,181 +97,88 @@ def print_param_norm(parameters, norm_type=2):
     return total_norm
 
 
-def evaluate(model, data_iter, epoch=0):
-    # test
+def evaluate(model, test_loader, rank, logger, save_path, best=None):
+    world_size = dist.get_world_size()
+    authentic = []
+    prediction = []
+
     with torch.no_grad():
         model.eval()
+        for image, mos in tqdm(test_loader):
+            image = image.to(rank)
+            mos = mos.to(rank)
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                pred = model(image)
+            authentic.append(mos.detach().cpu())
+            prediction.append(pred.detach().cpu())
 
-        num_total_tokens = 0
-        num_correct_tokens = 0
-        sum_cross_entropy = 0.0
+    authentic_tensor = torch.cat(authentic)
+    prediction_tensor = torch.cat(prediction)
 
-        for i, test_data in enumerate(data_iter):
-            test_data = {k: v.to(device) for k, v in test_data.items()}
+    gathered_authentic = [torch.zeros_like(authentic_tensor) for _ in range(world_size)]
+    gathered_prediction = [torch.zeros_like(prediction_tensor) for _ in range(world_size)]
 
-            input_token = test_data['input_token']
-            input_types = test_data['input_types']
-            output_token = test_data['output_token']
-            output_types = test_data['output_types']
+    dist.all_gather(gathered_authentic, authentic_tensor)
+    dist.all_gather(gathered_prediction, prediction_tensor)
 
-            output = model(input_token, input_types, train=False, output_token=output_token, output_types=output_types, criterion=criterion)
-            cross_entropy = output['cross_entropy']
-            hit_count = output['hit_count']
-            token_count = output['token_count']
-            
-            num_correct_tokens += hit_count
-            num_total_tokens += token_count
-            sum_cross_entropy += cross_entropy
+    all_authentic = torch.cat(gathered_authentic).numpy()
+    all_prediction = torch.cat(gathered_prediction).numpy()
 
-            print("Eval_Epoch {}: {} / {}, avg_cross_entropy: {}".format(epoch, i+1, len(data_iter), sum_cross_entropy / num_total_tokens))
+    test_srcc, test_krcc, test_plcc, test_rmse = cal(all_prediction, all_authentic)
 
-        acc_rate = float(num_correct_tokens) / float(num_total_tokens)
-        acc_rate = round(acc_rate, 2)
+    metrics = torch.tensor([test_srcc, test_krcc, test_plcc, test_rmse], device=rank)
+    dist.broadcast(metrics, src=0)
+    test_srcc, test_krcc, test_plcc, test_rmse = metrics.cpu().numpy()
 
-        avg_ce = sum_cross_entropy / num_total_tokens
-        avg_ce = round(avg_ce, 4)
-        
-        print('accuracy：%s' % acc_rate)
-        print('average ppl：%s' % avg_ce)
+    if rank == 0:
+        if best is not None:
+            if test_srcc > best[0]:
+                best[:4] = [test_srcc, test_krcc, test_plcc, test_rmse]
+                torch.save(model.module.state_dict(), save_path)
+            logger.info('test_srcc: {:.4f}, test_krcc: {:.4f}, test_plcc: {:.4f}, test_rmse: {:.4f}'
+                        .format(*best))
+        else:
+            logger.info('val_srcc: {:.4f}, val_krcc: {:.4f}, val_plcc: {:.4f}, val_rmse: {:.4f}'
+                        .format(test_srcc, test_krcc, test_plcc, test_rmse))
 
-        test_stats = {
-            "acc_rate": acc_rate,
-            "avg_ce": avg_ce
-        }
-    
-    return test_stats
+    return test_srcc, test_krcc, test_plcc, test_rmse
 
 
-def train_one_epoch(model, criterion, data_iter, optimizer, device, epoch, max_norm,
+def train_one_epoch(model, criterion, train_loader, optimizer, epoch, rank,
                     lr_scheduler=None, args=None, logger=None):
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
-
     model.train()
     criterion.train()
-    
-    metric_logger = misc.MetricLogger(delimiter="  ", weight_dict={})
-    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = args.print_freq
+    authentic = []
+    prediction = []
+    losses = []
 
-    _cnt = 0
-    for data in metric_logger.log_every(data_iter, print_freq, header, logger=logger):
-        data = {k: v.to(device) for k, v in data.items()}
-        input_token = data['input_token']
-        input_types = data['input_types']
-        output_token = data['output_token']
-        output_types = data['output_types']
+    train_sampler = train_loader.sampler
+    if hasattr(train_sampler, 'set_epoch'):
+        train_sampler.set_epoch(epoch)
 
-        if "multi_pred" in args.model_name:
-            output_token_2 = F.pad(output_token, (-1, 1, 0, 0, 0, 0), value=2)
-            output_types_2 = F.pad(output_types, (-1, 1, 0, 0, 0, 0), value=0)
-
-            output_token_3 = F.pad(output_token, (-2, 2, 0, 0, 0, 0), value=2)
-            output_types_3 = F.pad(output_types, (-2, 2, 0, 0, 0, 0), value=0)
-
-            output_token_4 = F.pad(output_token, (-3, 3, 0, 0, 0, 0), value=2)
-            output_types_4 = F.pad(output_types, (-3, 3, 0, 0, 0, 0), value=0)
-        
+    for image, mos in tqdm(train_loader, disable=(rank != 0)):
+        image = image.to(f'cuda:{rank}')
+        mos = mos.to(f'cuda:{rank}')
         with torch.cuda.amp.autocast(enabled=args.amp):
-            if "gmm" in args.model_name:
-                output = model(input_token, input_types, train=True, output_token=output_token)
-            else:
-                output = model(input_token, input_types, train=True)
+            pred = model(image)
+            authentic.append(mos.detach().cpu().numpy())
+            prediction.append(pred.detach().cpu().numpy())
+            loss = criterion(pred, mos)
+            losses.append(loss.item())
 
-            if "multi_pred" in args.model_name:
-                out1, out2, out3, out4 = output
-                output_view = out1.view([-1, out1.size(-1)])
-                output_token = output_token.view([-1])
-                output_types = output_types.view([-1])
-                loss_1 = criterion(output_view, output_token)
-                loss_1 = (loss_1 * output_types).sum() / max(output_types.sum(), 1)
-
-                output_view_2 = out2.view([-1, out2.size(-1)])
-                output_token_2 = output_token_2.view([-1])
-                output_types_2 = output_types_2.view([-1])
-                loss_2 = criterion(output_view_2, output_token_2)
-                loss_2 = (loss_2 * output_types_2).sum() / max(output_types_2.sum(), 1)
-
-                output_view_3 = out3.view([-1, out3.size(-1)])
-                output_token_3 = output_token_3.view([-1])
-                output_types_3 = output_types_3.view([-1])
-                loss_3 = criterion(output_view_3, output_token_3)
-                loss_3 = (loss_3 * output_types_3).sum() / max(output_types_3.sum(), 1)
-
-                output_view_4 = out4.view([-1, out4.size(-1)])
-                output_token_4 = output_token_4.view([-1])
-                output_types_4 = output_types_4.view([-1])
-                loss_4 = criterion(output_view_4, output_token_4)
-                loss_4 = (loss_4 * output_types_4).sum() / max(output_types_4.sum(), 1)
-
-                loss = loss_1 + loss_2 + loss_3 + loss_4
-            elif "gmm" in args.model_name:
-                output_view = output.view([-1, output.size(-1)])
-                output_types = output_types.view([-1])
-                loss = -torch.log(output_view).view([-1])
-                loss = (loss * output_types).sum() / max(output_types.sum(), 1)
-            else:
-                output_view = output.view([-1, output.size(-1)])
-                output_token = output_token.view([-1])
-                output_types = output_types.view([-1])
-                loss = criterion(output_view, output_token)
-                loss = (loss * output_types).sum() / max(output_types.sum(), 1)
-
-            if 'rwkv' in args.model_name:
-                if "multi_pred" in args.model_name:
-                    pass
-                else:
-                    loss = L2Wrap.apply(loss, output)
-
-            if args.distributed:
-                dist.barrier()
-                dist.all_reduce(loss)
-                loss = loss / args.world_size
-            loss_value = loss.item()
-
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            print("loss: ", loss)
-            print("output_view: ", output_view)
-            sys.exit(1)
-        
-        # amp backward function
-        if args.amp:
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            if max_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # original backward function
             optimizer.zero_grad()
             loss.backward()
-            # param_norm = print_param_norm(model.parameters())
-            # print("param_norm is {}".format(param_norm))
-            if max_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
 
-        metric_logger.update(loss=(loss_value, output_types.sum()), **{})
-        metric_logger.update(lr=(optimizer.param_groups[0]["lr"], 1))
-
-        _cnt += 1
         if lr_scheduler is not None:
             lr_scheduler.step()
+    train_srcc, train_krcc, train_plcc, train_rmse = cal(np.array(prediction), np.array(authentic))
+    if rank == 0:
+        logger.info(
+            'train_epoch: {}, train_loss: {:.4f}, train_srcc: {:.4f}, train_krcc: {:.4f}, train_plcc: {:.4f}, train_rmse: {:.4f}'
+            .format(epoch, sum(losses) / len(losses), train_srcc, train_krcc, train_plcc, train_rmse))
 
-        if args.debug:
-            if _cnt % 5000 == 0:
-                print("BREAK!"*5)
-                break
-    
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    train_stat = {k: meter.global_avg for k, meter in metric_logger.meters.items() if meter.count > 0}
-    return train_stat
+    return sum(losses) / len(losses)
 
 
 if __name__ == '__main__':
