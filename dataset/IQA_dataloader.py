@@ -11,6 +11,7 @@ class IQADataset(Dataset):
         data = pd.read_csv(csv_path)
         self.image_names = data['Image_name'].tolist()
         self.scores = data['mos'].tolist()
+        self.bbox = data['bbox'].tolist()
         self.folder_path = folder_path
         self.transform = transform
 
@@ -39,13 +40,14 @@ def get_dataloader(args):
     test_csv_path = '/data2/CarnegieBin_data/database/IQA/' + args.dataset + '/csv/test.csv'
     folder_path = '/data2/CarnegieBin_data/database/IQA/' + args.dataset + '/Images'
     train_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomVerticalFlip(),
-        transforms.ToTensor()
+        transforms.Resize((512, 384)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     test_transform = val_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.Resize((512, 384)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     train_dataset = IQADataset(csv_path=train_csv_path, folder_path=folder_path,
                                transform=train_transform, patch_num=args.patch_num)

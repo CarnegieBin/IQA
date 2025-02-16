@@ -401,36 +401,45 @@ class Block(BaseModule):
         return x
 
 
+from typing import Optional, Sequence, Dict, List, Tuple
+import torch
+from torch import nn
+from torch.nn import ModuleList
+
+
 @BACKBONES.register_module()
 class Net(BaseBackbone):
-    def __init__(self,
-                 img_size=224,
-                 patch_size=8,
-                 in_channels=3,
-                 out_indices=-1,
-                 drop_rate=0.,
-                 embed_dims=384,
-                 depth=12,
-                 drop_path_rate=0.,
-                 channel_gamma=1 / 4,
-                 shift_pixel=1,
-                 shift_mode='q_shift',
-                 init_mode='fancy',
-                 post_norm=True,
-                 key_norm=True,
-                 init_values=None,
-                 hidden_rate=8 / 3,
-                 final_norm=True,
-                 interpolate_mode='bicubic',
-                 with_cp=False,
-                 init_cfg=None,
-                 norm='RMSNorm'):
+    def __init__(
+            self,
+            img_size: Tuple[int, int] = (512, 384),
+            patch_size: int = 16,
+            in_channels: int = 3,
+            out_indices: Sequence[int] = (2, 4, 6, 8),
+            drop_rate: float = 0.0,
+            embed_dims: int = 768,
+            depth: int = 9,
+            drop_path_rate: float = 0.0,
+            channel_gamma: float = 1 / 4,
+            shift_pixel: int = 1,
+            shift_mode: str = 'q_shift',
+            init_mode: str = 'fancy',
+            post_norm: bool = True,
+            key_norm: bool = True,
+            init_values: Optional[float] = 1e-6,
+            hidden_rate: float = 8 / 3,
+            final_norm: bool = True,
+            interpolate_mode: str = 'bicubic',
+            with_cp: bool = False,
+            init_cfg: Optional[Dict] = None,
+            norm: str = 'RMSNorm'
+    ) -> None:
         super().__init__(init_cfg)
         self.embed_dims = embed_dims
         self.num_extra_tokens = 0
         self.num_layers = depth
         self.drop_path_rate = drop_path_rate
 
+        # Patch embedding
         self.patch_embed = PatchEmbed(
             in_channels=in_channels,
             input_size=img_size,
@@ -438,32 +447,41 @@ class Net(BaseBackbone):
             conv_type='Conv2d',
             kernel_size=patch_size,
             stride=patch_size,
-            bias=True)
-
-        self.patch_resolution = self.patch_embed.init_out_size
+            bias=True
+        )
+        self.patch_resolution: Tuple[int, int] = self.patch_embed.init_out_size
         num_patches = self.patch_resolution[0] * self.patch_resolution[1]
 
-        # Set position embedding
+        # Position embedding
         self.interpolate_mode = interpolate_mode
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches, self.embed_dims))
-
+        self.pos_embed: nn.Parameter = nn.Parameter(torch.zeros(1, num_patches, self.embed_dims))
         self.drop_after_pos = nn.Dropout(p=drop_rate)
 
-        if isinstance(out_indices, int):
-            out_indices = [out_indices]
-        assert isinstance(out_indices, Sequence), \
-            f'"out_indices" must by a sequence or int, ' \
-            f'get {type(out_indices)} instead.'
+        # Process out_indices
+        out_indices = list(out_indices)
         for i, index in enumerate(out_indices):
             if index < 0:
-                out_indices[i] = self.num_layers + index
-            assert 0 <= out_indices[i] <= self.num_layers, \
-                f'Invalid out_indices {index}'
-        self.out_indices = out_indices
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        self.layers = ModuleList()
-        for i in range(self.num_layers):
+                out_indices[i] += depth
+            assert 0 <= out_indices[i] < depth, f'Invalid out_indices {out_indices[i]}'
+
+        # Ensure unique and sorted indices
+        assert len(out_indices) == len(set(out_indices)), "out_indices must be unique"
+        self.out_indices = sorted(out_indices)
+        self.index_map: Dict[int, int] = {index: idx for idx, index in enumerate(self.out_indices)}
+
+        # CNN blocks with adaptive pooling to ensure consistent output size
+        self.cnn_blocks = ModuleList([
+            nn.Sequential(
+                nn.Conv2d(self.embed_dims, self.embed_dims, kernel_size=3, stride=3, padding=1),
+                nn.AdaptiveAvgPool2d((1, 1))  # Ensure consistent output size
+            ) for _ in self.out_indices
+        ])
+
+        # Stochastic depth
+        dpr: List[float] = torch.linspace(0, drop_path_rate, depth).tolist()
+
+        self.layers: ModuleList[Block] = ModuleList()
+        for i in range(depth):
             self.layers.append(Block(
                 n_embd=embed_dims,
                 n_layer=depth,
@@ -481,46 +499,53 @@ class Net(BaseBackbone):
                 norm=norm
             ))
 
+        # Final components
         self.final_norm = final_norm
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.head = nn.Linear(in_features=embed_dims, out_features=1, bias=True)
-        if final_norm:
-            self.ln1 = nn.LayerNorm(self.embed_dims) if norm == 'LayerNorm' else RMSNorm(self.embed_dims)
+        self.head = nn.Linear(embed_dims, 1, bias=True)
 
-    def forward_features(self, x):
-        B = x.shape[0]
+        if final_norm:
+            norm_layer = nn.LayerNorm(embed_dims) if norm == 'LayerNorm' else RMSNorm(embed_dims)
+            self.ln1: nn.Module = norm_layer
+
+    def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         x, patch_resolution = self.patch_embed(x)
 
+        # Position embedding
         x = x + resize_pos_embed(
             self.pos_embed,
             self.patch_resolution,
             patch_resolution,
             mode=self.interpolate_mode,
-            num_extra_tokens=self.num_extra_tokens)
-
+            num_extra_tokens=self.num_extra_tokens
+        )
         x = self.drop_after_pos(x)
 
-        outs = []
+        outs: List[torch.Tensor] = []
         for i, layer in enumerate(self.layers):
             x = layer(x, patch_resolution)
 
             if i == len(self.layers) - 1 and self.final_norm:
                 x = self.ln1(x)
 
-            if i in self.out_indices:
+            if i in self.index_map:
                 B, _, C = x.shape
-                patch_token = x.reshape(B, *patch_resolution, C)
-                patch_token = patch_token.permute(0, 3, 1, 2)
+                patch_token = x.view(B, *patch_resolution, C).permute(0, 3, 1, 2)
+                outs.append(patch_token)
 
-                out = patch_token
-                outs.append(out)
         return tuple(outs)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.forward_features(x)
-        x = self.pool(features[0])
-        mos = self.head(x.reshape(x.shape[0], -1))
-        return mos
+        outs = []
+        for feature, cnn_block in zip(features, self.cnn_blocks):
+            out = cnn_block(feature)
+            outs.append(out)
+
+        # Feature fusion
+        fused = torch.stack(outs, dim=0).sum(dim=0)
+        pooled = self.pool(fused)
+        return self.head(pooled.flatten(1))
 
 
 if __name__ == '__main__':

@@ -11,7 +11,7 @@ from util.logger import setup_logger
 from dataset.IQA_dataloader import get_dataloader
 from util.utils import calculate_metrics as cal
 from util.utils import build_optimizer_scheduler as bop
-from models.vrwkv import Net
+from models.DEIT import Net
 from torch.utils.data import DataLoader
 from datetime import datetime
 
@@ -51,15 +51,15 @@ def get_args_parser():
                         help="Enable mixed precision training")
     parser.add_argument('--epoch', default=100, type=int,
                         help='Number of training epochs')
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=48, type=int,
                         help='Batch size per GPU')
-    parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0, 2, 3, 6, 7])
+    parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0, 2, 3, 4, 5, 6, 7])
     # ===================================
 
     # Data parameters
     parser.add_argument('--dataset', default='RoIciCIQAD', type=str,
                         help='Dataset name for training')
-    parser.add_argument('--patch_num', default=10, type=int,
+    parser.add_argument('--patch_num', default=1, type=int,
                         help=' ')
     return parser
 
