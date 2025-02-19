@@ -1,6 +1,5 @@
-# RWKVQA: No-Reference Image Quality Assessment Based on RWKV Architecture
+# No-Reference Video Quality Assessment 
 
-This project implements a vision model based on the RWKV architecture (RWKV6.0), which significantly improves inference speed while maintaining assessment accuracy. The approach leverages the efficient recurrent neural network structure of RWKV for image quality evaluation tasks.
 
 ## Environment Dependencies
 
@@ -22,21 +21,10 @@ The main functionality is implemented in:
 - `main.py`: Contains complete training, validation, and testing code
 - `dataset/IQA_dataloader.py`: Handles data loading and preprocessing
 
-### Dataset Preparation
-Organize your dataset in the following structure:  
-dataset    
-├── csv  
-│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── train.csv  
-│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── val.csv  
-│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── test.csv   
-└── Images       
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── image1.jpg  
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── image2.jpg  
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── ...
 
 
 Each CSV file should contain 2 columns:
-- `Image_name`: File name of the image (e.g., "image1.jpg")
+- `Video_name`: File name of the Video
 - `mos`: Mean Opinion Score for the corresponding image
 
 ### Execution
