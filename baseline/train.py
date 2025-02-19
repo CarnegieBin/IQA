@@ -1,17 +1,18 @@
 import os
+# gpu_ids that you use
+os.environ['CUDA_DEVICE_VISIBLE'] = '0, 2, 3, 4'
 import torch
 import json
-import time
 import numpy as np
 import random
 import argparse
 from tqdm import tqdm
 from pathlib import Path
 from util.logger import setup_logger
-from dataset.IQA_dataloader import get_dataloader
+from baseline.IQA_dataloader import get_dataloader
 from util.utils import calculate_metrics as cal
 from util.utils import build_optimizer_scheduler as bop
-from models.DEIT import Net
+from baseline.models.ResNet_modified import Net
 from torch.utils.data import DataLoader
 from datetime import datetime
 
@@ -20,7 +21,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('IQA Training', add_help=False)
 
     # Optimizer parameters
-    parser.add_argument('--lr', type=float, default=3e-4,
+    parser.add_argument('--lr', type=float, default=1e-4,
                         help="Initial learning rate (suggested: 1e-4 ~ 5e-4)")
     parser.add_argument('--weight_decay', type=float, default=0.01,
                         help="Weight decay coefficient (AdamW-specific, suggested: 0.01~0.1)")
@@ -51,14 +52,15 @@ def get_args_parser():
                         help="Enable mixed precision training")
     parser.add_argument('--epoch', default=100, type=int,
                         help='Number of training epochs')
-    parser.add_argument('--batch_size', default=48, type=int,
+    parser.add_argument('--batch_size', default=8, type=int,
                         help='Batch size per GPU')
-    parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0, 2, 3, 4, 5, 6, 7])
+    parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0, 1, 2, 3, 4, 5])
     # ===================================
 
     # Data parameters
-    parser.add_argument('--dataset', default='RoIciCIQAD', type=str,
+    parser.add_argument('--dataset', default='koniq10k', type=str,
                         help='Dataset name for training')
+    parser.add_argument('--tag', default='ResNet', type=str)
     parser.add_argument('--patch_num', default=1, type=int,
                         help=' ')
     return parser
@@ -79,11 +81,11 @@ def evaluate(model, loader, logger, save_path=None, best_metrics=None):
     prediction = np.concatenate(prediction)
     metrics = cal(prediction, authentic)
 
-    if save_path and best_metrics:
-        if metrics[0] > best_metrics[0]:
+    if metrics[0] > best_metrics[0]:
+        best_metrics[:] = metrics
+        logger.info(f'New best model saved! Metrics: {metrics}')
+        if save_path:
             torch.save(model.state_dict(), save_path)
-            best_metrics[:] = metrics
-            logger.info(f'New best model saved! Metrics: {metrics}')
     return metrics
 
 
@@ -148,7 +150,6 @@ if __name__ == '__main__':
     )
 
     val_loader = DataLoader(val_set, batch_size=args.batch_size * gpu_num, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size * gpu_num, shuffle=False)
 
     # 优化器
     optimizer, scheduler = bop(model, args)
@@ -158,18 +159,16 @@ if __name__ == '__main__':
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     log_path = os.path.join(args.log_dir, args.dataset, timestamp)
-    Path(log_path).mkdir(parents=True, exist_ok=True)  # 自动创建嵌套目录
+    Path(log_path).mkdir(parents=True, exist_ok=True)
 
-    # 初始化日志系统（日志文件保存在日志路径下）
     logger = setup_logger(
-        output=os.path.join(log_path, 'log.txt'),  # 统一保存到带时间戳的目录
+        output=os.path.join(log_path,'log.txt'),
         name='IQA'
     )
 
-    # 保存训练参数到同目录（包含完整配置的副本）
     args_path = os.path.join(log_path, 'runtime_args.json')
     with open(args_path, 'w') as f:
-        json.dump(vars(args), f, indent=2, sort_keys=True)  # 添加排序保证可读性
+        json.dump(vars(args), f, indent=2, sort_keys=True)
 
     # 训练循环
     best_val = [0.0, 0.0, 0.0, 0.0]
@@ -178,10 +177,12 @@ if __name__ == '__main__':
 
     for epoch in range(args.epoch):
         train_epoch(model, criterion, train_loader, optimizer, epoch, scaler, args, logger)
-        _ = evaluate(model, val_loader, logger, save_path, best_val)
+        test_metrics = evaluate(model, val_loader, logger, save_path, best_val)
 
-        test_metrics = evaluate(model, test_loader, logger, save_path=None, best_metrics=best_test)
-        logger.info(f'Final Test | SRCC: {test_metrics[0]:.4f} KRCC: {test_metrics[1]:.4f} '
+        logger.info(f'Test | SRCC: {test_metrics[0]:.4f} KRCC: {test_metrics[1]:.4f} '
                     f'PLCC: {test_metrics[2]:.4f} RMSE: {test_metrics[3]:.4f}')
+
+    logger.info(f'Final Test | SRCC: {best_val[0]:.4f} KRCC: {best_val[1]:.4f} '
+                    f'PLCC: {best_val[2]:.4f} RMSE: {best_val[3]:.4f}')
 
 
